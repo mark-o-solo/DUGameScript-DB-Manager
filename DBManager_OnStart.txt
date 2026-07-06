@@ -1,0 +1,324 @@
+-- ============================================================
+-- DB Manager PB Script v2.1
+-- Push-based delivery (one chunk/tick, no acks)
+-- Poll-based command reception (getScriptOutput every tick)
+-- ============================================================
+
+HideWidget = true --export: hide PB widget
+BGImageUrl = "https://du-front.thethirdverse.net/image/e187f7856bde7f2e6be878d82589687749ba038a-slate.png" --export: screen background image
+if HideWidget then unit.hideWidget() end
+
+unit.setTimer('tick', 0.1)
+
+local json = require("dkjson")
+
+-- State
+Init             = false
+screen           = nil
+databases        = {}
+dbIconPath       = ""
+searchQuery      = ""
+searchResults    = {}
+
+-- Push state
+sendChunks       = {}
+sendSession      = 0
+chunkIdx         = 0     -- 0=start new cycle; 1..N=send chunk N next
+cooldown         = 0     -- ticks remaining in inter-cycle pause
+COOLDOWN_MAX     = 10    -- ~1 s between full refreshes
+CHUNK_SIZE       = 450
+
+-- Dedup guard (prevents double-processing if onOutputChanged also fires)
+lastProcessedOut = ""
+
+-- Mousewheel accumulator (read from system each tick, piggybacked on next message)
+wheelDelta       = 0
+wheelMsgSeq      = 0   -- monotonic counter to make wheel-only messages unique (avoids lastInput dedup)
+
+-- ============================================================
+-- Initialization: discover connected elements
+-- ============================================================
+-- Known good DataBank icon path (game asset, relative to content root)
+local DATABANK_ICON = "resources_generated/elements/transformers/transformer-databank_001/icons/env_transformer-databank_001_icon.png"
+
+if not Init then
+    local slotList = {slot1,slot2,slot3,slot4,slot5,slot6,slot7,slot8,slot9,slot10}
+    for _, el in ipairs(slotList) do
+        if el and type(el) == "table" and el.getClass then
+            local ok, cls = pcall(function() return el.getClass() end)
+            if ok then
+                if cls == "ScreenUnit" then
+                    screen = el; screen.activate()
+                elseif cls == "DataBankUnit" then
+                    local ok2, nm = pcall(function() return el.getName() end)
+                    local dbName = (ok2 and nm and nm ~= "") and nm or ("DB " .. (#databases + 1))
+                    databases[#databases + 1] = {element = el, name = dbName}
+                    -- Try to get icon from element's item ID; fall back to hardcoded path
+                    if dbIconPath == "" then
+                        local ok3, iid = pcall(function() return el.getItemId() end)
+                        if ok3 and iid then
+                            local ok4, itm = pcall(function() return system.getItem(iid) end)
+                            if ok4 and itm and itm.iconPath and itm.iconPath ~= "" then
+                                dbIconPath = itm.iconPath
+                            end
+                        end
+                        -- Always fall back to hardcoded path if still empty
+                        if dbIconPath == "" then
+                            dbIconPath = DATABANK_ICON
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if screen then
+        screen.setRenderScript(ScreenContent)
+        -- Slot detection already knows the DB count instantly; send it
+        -- right away (well before the full chunked data transfer, which
+        -- can take several seconds) so the screen can show "N Databanks
+        -- connected - Loading Data" instead of a stale "no databanks"
+        -- state or a blank screen while readAllDBs()/StartSend() catch up.
+        pcall(function() screen.setScriptInput(json.encode({t="boot", numDb=#databases, bg=BGImageUrl})) end)
+    end
+    Init = true
+end
+
+-- ============================================================
+-- Read all DBs
+-- ============================================================
+function readAllDBs()
+    local data = {}
+    for _, db in ipairs(databases) do
+        local el = db.element
+        local ok, keys = pcall(el.getKeyList)
+        local entries = {}
+        if ok and keys then
+            for _, key in ipairs(keys) do
+                local ok2, val = pcall(el.getStringValue, key)
+                entries[#entries + 1] = {key = key, value = (ok2 and val) or ""}
+            end
+        end
+        data[#data + 1] = {name = db.name, entryCount = #entries, entries = entries}
+    end
+    return data
+end
+
+-- ============================================================
+-- Search
+-- ============================================================
+function searchDBs(query)
+    searchResults = {}
+    if not query or query == "" then return end
+    local q = string.lower(query)
+    for i, db in ipairs(databases) do
+        local el = db.element
+        local ok, keys = pcall(el.getKeyList)
+        local matches = {}
+        if ok and keys then
+            for _, key in ipairs(keys) do
+                local ok2, sv = pcall(el.getStringValue, key)
+                local v = ok2 and string.lower(sv or "") or ""
+                if string.find(string.lower(key), q, 1, true) or string.find(v, q, 1, true) then
+                    matches[#matches + 1] = key
+                end
+            end
+        end
+        if #matches > 0 then searchResults[i] = matches end
+    end
+end
+
+-- ============================================================
+-- Execute a command sent by the screen
+-- ============================================================
+function executeCommand(cmd)
+    if not cmd then return end
+    local action = cmd.action
+
+    if action == "search" then
+        searchQuery = cmd.query or ""; searchDBs(searchQuery)
+
+    elseif action == "clearSearch" then
+        searchQuery = ""; searchResults = {}
+
+    elseif action == "editEntry" then
+        local dbIdx = cmd.dbIndex
+        if dbIdx and databases[dbIdx] and cmd.key then
+            pcall(databases[dbIdx].element.setStringValue, cmd.key, cmd.value or "")
+        end
+
+    elseif action == "editKey" then
+        local dbIdx = cmd.dbIndex
+        if dbIdx and databases[dbIdx] and cmd.oldKey and cmd.newKey then
+            local el = databases[dbIdx].element
+            local ok, val = pcall(el.getStringValue, cmd.oldKey)
+            pcall(el.setStringValue, cmd.newKey, (ok and val) or "")
+            if cmd.oldKey ~= cmd.newKey then pcall(el.clearValue, cmd.oldKey) end
+        end
+
+    elseif action == "deleteEntry" then
+        local dbIdx = cmd.dbIndex
+        if dbIdx and databases[dbIdx] and cmd.key then
+            pcall(databases[dbIdx].element.clearValue, cmd.key)
+        end
+
+    elseif action == "addEntry" then
+        local dbIdx = cmd.dbIndex
+        if dbIdx and databases[dbIdx] and cmd.key then
+            pcall(databases[dbIdx].element.setStringValue, cmd.key, cmd.value or "")
+        end
+
+    elseif action == "clone" then
+        local srcIdx = cmd.sourceIndex
+        local targets = cmd.targets or {}
+        if srcIdx and databases[srcIdx] then
+            local srcEl = databases[srcIdx].element
+            local ok, srcKeys = pcall(srcEl.getKeyList)
+            for _, tgtIdx in ipairs(targets) do
+                if databases[tgtIdx] and tgtIdx ~= srcIdx then
+                    local tgtEl = databases[tgtIdx].element
+                    if cmd.wipeFirst then pcall(tgtEl.clear) end
+                    if ok and srcKeys then
+                        for _, key in ipairs(srcKeys) do
+                            local ok2, val = pcall(srcEl.getStringValue, key)
+                            pcall(tgtEl.setStringValue, key, (ok2 and val) or "")
+                        end
+                    end
+                end
+            end
+        end
+
+    elseif action == "cloneItems" then
+        local srcIdx  = cmd.sourceIndex
+        local targets = cmd.targets or {}
+        local keys    = cmd.keys    or {}
+        if srcIdx and databases[srcIdx] then
+            local srcEl = databases[srcIdx].element
+            for _, tgtIdx in ipairs(targets) do
+                if databases[tgtIdx] and tgtIdx ~= srcIdx then
+                    local tgtEl = databases[tgtIdx].element
+                    for _, key in ipairs(keys) do
+                        local ok2, val = pcall(srcEl.getStringValue, key)
+                        if ok2 then pcall(tgtEl.setStringValue, key, val or "") end
+                    end
+                end
+            end
+        end
+
+    elseif action == "copyLocations" then
+        local srcIdx = cmd.sourceIndex
+        local targets = cmd.targets or {}
+        local LOC_KEYS = {"SavedLocations", "SavedLocationNames"}
+        if srcIdx and databases[srcIdx] then
+            local srcEl = databases[srcIdx].element
+            for _, tgtIdx in ipairs(targets) do
+                if databases[tgtIdx] and tgtIdx ~= srcIdx then
+                    local tgtEl = databases[tgtIdx].element
+                    for _, key in ipairs(LOC_KEYS) do
+                        local ok2, val = pcall(srcEl.getStringValue, key)
+                        if ok2 and val and val ~= "" then
+                            pcall(tgtEl.setStringValue, key, val)
+                        end
+                    end
+                end
+            end
+        end
+
+    elseif action == "wipeDB" then
+        local dbIdx = cmd.dbIndex
+        if dbIdx and databases[dbIdx] then
+            local el = databases[dbIdx].element
+            pcall(function() el.clear() end)
+        end
+    end
+end
+
+-- ============================================================
+-- Process any pending screen output (command from screen)
+-- Safe to call from both onOutputChanged event AND tick poll.
+-- ============================================================
+function ProcessScreenOutput(out)
+    if not out or out == "" or out == lastProcessedOut then return end
+    lastProcessedOut = out
+    pcall(function() screen.clearScriptOutput() end)
+    local ok, cmd = pcall(json.decode, out)
+    if ok and cmd and cmd.action then
+        executeCommand(cmd)
+        cooldown  = 0   -- respond immediately with fresh data
+        chunkIdx  = 0
+    end
+end
+
+-- Called from onOutputChanged event handler (belt-and-suspenders)
+function HandleScreenCommand(output)
+    ProcessScreenOutput(output)
+end
+
+-- ============================================================
+-- Start a new send cycle: build payload, send HDR
+-- ============================================================
+function StartSend()
+    local payload = json.encode({
+        databases     = readAllDBs(),
+        searchQuery   = searchQuery,
+        searchResults = searchResults,
+        dbIconPath    = dbIconPath,
+    })
+    sendChunks  = {}
+    sendSession = sendSession + 1
+    local pos = 1
+    while pos <= #payload do
+        local ep = math.min(pos + CHUNK_SIZE - 1, #payload)
+        sendChunks[#sendChunks + 1] = payload:sub(pos, ep)
+        pos = ep + 1
+    end
+    local hMsg = json.encode({t="hdr", s=sendSession, n=#sendChunks, wh=wheelDelta})
+    pcall(function() screen.setScriptInput(hMsg) end)
+    wheelDelta = 0
+    chunkIdx = 1
+end
+
+-- ============================================================
+-- Tick: poll screen output, then push next chunk
+-- ============================================================
+function Tick()
+    if not screen then return end
+
+    -- Poll screen for commands (primary mechanism)
+    local ok, out = pcall(function() return screen.getScriptOutput() end)
+    if ok and out then ProcessScreenOutput(out) end
+
+    -- Accumulate mousewheel delta from system (DUSystem, not screen element)
+    local ok_wh, wh = pcall(function() return system.getMouseWheel() end)
+    if ok_wh and type(wh) == "number" and wh ~= 0 then
+        wheelDelta = wheelDelta + wh
+    end
+
+    -- Inter-cycle cooldown: still send wheel-only messages when needed
+    if cooldown > 0 then
+        if wheelDelta ~= 0 then
+            wheelMsgSeq = wheelMsgSeq + 1
+            local wMsg = json.encode({t="wh", wh=wheelDelta, seq=wheelMsgSeq})
+            pcall(function() screen.setScriptInput(wMsg) end)
+            wheelDelta = 0
+        end
+        cooldown = cooldown - 1
+        return
+    end
+
+    if chunkIdx == 0 then
+        StartSend()
+    elseif chunkIdx <= #sendChunks then
+        -- Piggyback accumulated wheel delta on chunk messages
+        local cMsg = json.encode({t="c", s=sendSession, i=chunkIdx, d=sendChunks[chunkIdx], wh=wheelDelta})
+        pcall(function() screen.setScriptInput(cMsg) end)
+        wheelDelta = 0
+        chunkIdx = chunkIdx + 1
+    else
+        -- Cycle complete; pause before next refresh
+        cooldown = COOLDOWN_MAX
+        chunkIdx = 0
+    end
+end
+
+Tick()

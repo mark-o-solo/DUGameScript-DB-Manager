@@ -1,0 +1,1422 @@
+-- ============================================================
+-- DB Manager Screen Render Script v2.2
+-- Scrollbar + drag, fixed keyboard, Copy Locations, icon fix
+-- ============================================================
+
+-- ── Inline JSON ──────────────────────────────────────────────
+json = {}
+function json.encode(val)
+    if val == nil then return "null" end
+    local t = type(val)
+    if t == "string" then
+        local s = val:gsub('\\','\\\\'):gsub('"','\\"'):gsub('\n','\\n'):gsub('\r','\\r'):gsub('\t','\\t')
+        return '"'..s..'"'
+    elseif t == "number" then return tostring(val)
+    elseif t == "boolean" then return val and "true" or "false"
+    elseif t == "table" then
+        local isArr = true; local idx = 0
+        for k,_ in pairs(val) do idx=idx+1; if k~=idx then isArr=false; break end end
+        local parts = {}
+        if isArr then
+            for i=1,#val do parts[#parts+1] = json.encode(val[i]) or "null" end
+            return "["..table.concat(parts,",").."]"
+        else
+            for k,v in pairs(val) do
+                parts[#parts+1] = '"'..tostring(k)..'":'.. (json.encode(v) or "null")
+            end
+            return "{"..table.concat(parts,",").."}"
+        end
+    end
+    return "null"
+end
+function json.decode(str)
+    if not str then return nil end
+    local pos = 1
+    local function skip() pos = (str:match('^%s*()',pos)) end
+    local function parse()
+        skip()
+        local c = str:sub(pos,pos)
+        if c == '"' then
+            pos=pos+1; local s={}
+            while pos<=#str do
+                local ch=str:sub(pos,pos)
+                if ch=='"' then pos=pos+1; return table.concat(s)
+                elseif ch=='\\' then
+                    pos=pos+1; local e=str:sub(pos,pos)
+                    if e=='n' then s[#s+1]='\n' elseif e=='t' then s[#s+1]='\t'
+                    elseif e=='"' then s[#s+1]='"' elseif e=='\\' then s[#s+1]='\\'
+                    else s[#s+1]=e end; pos=pos+1
+                else s[#s+1]=ch; pos=pos+1 end
+            end
+            return table.concat(s)
+        elseif c=='{' then
+            pos=pos+1; skip(); local obj={}
+            if str:sub(pos,pos)=='}' then pos=pos+1; return obj end
+            while pos<=#str do
+                skip(); local key=parse(); skip(); pos=pos+1; skip()
+                obj[key]=parse(); skip()
+                local nx=str:sub(pos,pos)
+                if nx=='}' then pos=pos+1; return obj
+                elseif nx==',' then pos=pos+1 end
+            end
+            return obj
+        elseif c=='[' then
+            pos=pos+1; skip(); local arr={}
+            if str:sub(pos,pos)==']' then pos=pos+1; return arr end
+            while pos<=#str do
+                skip(); arr[#arr+1]=parse(); skip()
+                local nx=str:sub(pos,pos)
+                if nx==']' then pos=pos+1; return arr
+                elseif nx==',' then pos=pos+1 end
+            end
+            return arr
+        elseif c=='t' then pos=pos+4; return true
+        elseif c=='f' then pos=pos+5; return false
+        elseif c=='n' then pos=pos+4; return nil
+        elseif c=='-' or c:match('%d') then
+            local ns=pos; if c=='-' then pos=pos+1 end
+            while pos<=#str and str:sub(pos,pos):match('%d') do pos=pos+1 end
+            if pos<=#str and str:sub(pos,pos)=='.' then
+                pos=pos+1
+                while pos<=#str and str:sub(pos,pos):match('%d') do pos=pos+1 end
+            end
+            if pos<=#str and str:sub(pos,pos):lower()=='e' then
+                pos=pos+1
+                if pos<=#str and (str:sub(pos,pos)=='+' or str:sub(pos,pos)=='-') then pos=pos+1 end
+                while pos<=#str and str:sub(pos,pos):match('%d') do pos=pos+1 end
+            end
+            return tonumber(str:sub(ns,pos-1))
+        end
+        return nil
+    end
+    return parse()
+end
+
+-- ── Layers ───────────────────────────────────────────────────
+bgLayer      = createLayer()
+listLayer    = createLayer()
+uiLayer      = createLayer()
+overlayLayer = createLayer()
+
+setDefaultShadow(listLayer,    Shape_Text, 6, 0,0,0,0.85)
+setDefaultShadow(uiLayer,      Shape_Text, 6, 0,0,0,0.85)
+setDefaultShadow(overlayLayer, Shape_Text, 6, 0,0,0,0.85)
+
+local _rx, _ry = getResolution()
+local _scale   = math.min(_rx/1050, _ry/590)
+
+font      = loadFont("RobotoMono-Bold", math.max(12, math.floor(19*_scale)))
+smallfont = loadFont("Oxanium",         math.max(10, math.floor(14*_scale)))
+medfont   = loadFont("Oxanium",         math.max(12, math.floor(17*_scale)))
+largefont = loadFont("RobotoMono-Bold", math.max(16, math.floor(28*_scale)))
+keyfont   = loadFont("Oxanium",         math.max(14, math.floor(22*_scale)))
+
+-- ── Background image (URL comes from the PB's BGImageUrl --export
+-- param, delivered via the "boot" message below; loaded every frame,
+-- same as SRT controls) ──
+bgImageUrl = bgImageUrl or "https://du-front.thethirdverse.net/image/e187f7856bde7f2e6be878d82589687749ba038a-slate.png"
+local _bgImg = loadImage(bgImageUrl)
+if _bgImg then
+    setNextFillColor(bgLayer, 1,1,1,1)
+    addImage(bgLayer, _bgImg, 0, 0, _rx, _ry)
+end
+setNextFillColor(bgLayer, 0,0,0,0.55)
+addBox(bgLayer, 0, 0, _rx, _ry)
+
+-- ── Colors / constants ───────────────────────────────────────
+GOLD     = {1.0, 0.65, 0.1,  1}
+WHITE    = {1,   1,    1,    1}
+DIM_WHITE= {0.75,0.75, 0.75, 1}
+DIM      = {0.55,0.55, 0.55, 0.8}
+RED      = {1,   0.25, 0.25, 1}
+GREEN    = {0.2, 0.9,  0.35, 1}
+CYAN     = {0.35,0.9,  1,    1}
+ROW_H    = math.max(34, math.floor(44*_scale))
+PAD      = 10
+SB_W     = 16    -- scrollbar width
+SB_AH    = 22    -- scrollbar arrow button height
+KB_PAD   = 8     -- keyboard outer padding
+KB_MRG   = 3     -- keyboard key gap
+
+-- ── Init (once per screen lifetime) ─────────────────────────
+if not init then
+    rx, ry                  = getResolution()
+    view                    = "home"
+    selectedDB              = 0
+    selectedKey             = ""
+    scrollY                 = 0
+    maxScrollY              = 0
+    lastListY               = 0
+    mx, my                  = 0, 0
+    down                    = false
+    release                 = false
+    prevDown                = false
+    scrollDragActive        = false
+    scrollDragStartY        = 0
+    scrollDragStartScrollY  = 0
+    contentDragActive       = false
+    contentDragStartY       = 0
+    contentDragStartScrollY = 0
+    searchQuery             = ""
+    searchResults           = {}
+    cloneSource             = 1
+    cloneTargets            = {}
+    cloneWipe               = false
+    cloneConfirm            = false
+    copyLocConfirm          = false
+    kbTarget                = ""
+    kbText                  = ""
+    kbShift                 = false
+    kbSpecial               = false
+    editKey                 = ""
+    editValue               = ""
+    isNewEntry              = false
+    dbData                  = {}
+    dbCount                 = 0
+    pendingDbCount          = -1     -- -1 = "boot" message not received yet
+    dataLoaded              = false  -- true once the first full chunked payload is decoded
+
+    recvSession             = 0
+    recvExpected            = 0
+    recvChunks              = {}
+    recvGotCount            = 0
+    lastInput               = ""
+    lastCmd                 = "none"
+    frameCount              = 0
+    cloneItemSelections     = {}
+    debugEnabled            = false
+    wipeConfirm             = false
+    lastWheelDbg            = 0
+    init                    = true
+end
+
+-- ── Utility ──────────────────────────────────────────────────
+function setFrames() requestAnimationFrame(2) end
+function clamp(v,lo,hi) return (v<lo and lo) or (v>hi and hi) or v end
+function truncStr(s, maxW)
+    if not s then return "" end
+    if #s <= maxW then return s end
+    return s:sub(1, maxW-2)..".."
+end
+function hitTest(bx,by,bw,bh)
+    return mx>=bx and mx<=bx+bw and my>=by and my<=by+bh
+end
+function sendCommand(cmd)
+    lastCmd = (cmd.action or "?")
+    if cmd.query   then lastCmd = lastCmd.."="..tostring(cmd.query) end
+    if cmd.key     then lastCmd = lastCmd.."="..tostring(cmd.key) end
+    setOutput(json.encode(cmd))
+end
+function tryImg(img)
+    if not img then return false end
+    local ok, r = pcall(isImageLoaded, img)
+    return ok and r
+end
+
+-- ── Draw helpers ─────────────────────────────────────────────
+function drawHeader(title)
+    local h = ROW_H*1.5
+    setNextStrokeColor(uiLayer,0.75,0.75,0.75,1)
+    setNextStrokeWidth(uiLayer,2)
+    addLine(uiLayer,0,h,rx,h)
+    setNextFillColor(uiLayer,1,1,1,1)
+    setNextTextAlign(uiLayer,AlignH_Center,AlignV_Middle)
+    addText(uiLayer,largefont,title,rx*0.5,h*0.5)
+    return h
+end
+
+function drawButton(x,y,w,h,text,col,fnt)
+    local hover = hitTest(x,y,w,h)
+    local r,g,b,a = col[1],col[2],col[3],col[4] or 1
+    setNextFillColor(uiLayer, hover and r*0.25 or 0.12, hover and g*0.25 or 0.15, hover and b*0.25 or 0.2, 0.95)
+    addBox(uiLayer,x,y,w,h)
+    setNextStrokeColor(uiLayer,r,g,b,a)
+    setNextStrokeWidth(uiLayer,2)
+    addBox(uiLayer,x,y,w,h)
+    setNextFillColor(uiLayer,r,g,b,a)
+    setNextTextAlign(uiLayer,AlignH_Center,AlignV_Middle)
+    addText(uiLayer,fnt or medfont,text,x+w*0.5,y+h*0.5)
+    return hover
+end
+
+function drawBackButton(y)
+    local bw,bh = 90,ROW_H
+    local hover = hitTest(PAD,y,bw,bh)
+    setNextFillColor(uiLayer, hover and 0.2 or 0.1, hover and 0.12 or 0.08, hover and 0.15 or 0.1, 0.95)
+    addBox(uiLayer,PAD,y,bw,bh)
+    setNextStrokeColor(uiLayer,GOLD[1],GOLD[2],GOLD[3],1)
+    setNextStrokeWidth(uiLayer,2)
+    addBox(uiLayer,PAD,y,bw,bh)
+    setNextFillColor(uiLayer,1,1,1,1)
+    setNextTextAlign(uiLayer,AlignH_Center,AlignV_Middle)
+    addText(uiLayer,medfont,"< Back",PAD+bw*0.5,y+bh*0.5)
+    return hover
+end
+
+function drawDBIcon(layer, cx, cy, iconSize, alpha)
+    local drawn = false
+    if dbIconHard then
+        drawn = pcall(function()
+            setNextFillColor(layer,1,1,1,alpha)
+            addImage(layer,dbIconHard,cx,cy,iconSize,iconSize)
+        end)
+    end
+    if not drawn then
+        setNextFillColor(layer,0.15,0.45,0.5,alpha*0.9)
+        addBox(layer,cx,cy,iconSize,iconSize)
+        setNextFillColor(layer,1,1,1,alpha)
+        setNextTextAlign(layer,AlignH_Center,AlignV_Middle)
+        addText(layer,medfont,"DB",cx+iconSize*0.5,cy+iconSize*0.5)
+    end
+end
+
+-- ── Scrollbar ────────────────────────────────────────────────
+function getScrollbarGeom(listY)
+    local sbX   = rx - SB_W  -- flush with right edge
+    local sbTY  = listY + SB_AH
+    local sbH   = ry - listY - SB_AH * 2
+    local visH  = ry - listY
+    local totH  = maxScrollY + visH
+    local thH   = math.max(24, math.floor(sbH * (visH / math.max(visH, totH))))
+    local thY   = sbTY + (maxScrollY > 0 and (scrollY / maxScrollY) * (sbH - thH) or 0)
+    return sbX, sbTY, sbH, thH, thY
+end
+
+function drawScrollbar(listY)
+    if maxScrollY <= 0 then return end
+    local sbX, sbTY, sbH, thH, thY = getScrollbarGeom(listY)
+    local upY = listY
+    local dnY = ry - SB_AH
+
+    -- Track background
+    setNextFillColor(uiLayer, 0.10, 0.12, 0.16, 0.95)
+    addBox(uiLayer, sbX, sbTY, SB_W, sbH)
+
+    -- Thumb
+    local onThumb = scrollDragActive or hitTest(sbX, thY, SB_W, thH)
+    setNextFillColor(uiLayer, onThumb and 0.65 or 0.40, onThumb and 0.70 or 0.45, onThumb and 0.80 or 0.55, 1)
+    addBox(uiLayer, sbX, thY, SB_W, thH)
+
+    -- Up arrow button
+    local hovUp = hitTest(sbX, upY, SB_W, SB_AH)
+    setNextFillColor(uiLayer, hovUp and 0.28 or 0.14, hovUp and 0.32 or 0.17, hovUp and 0.38 or 0.22, 1)
+    addBox(uiLayer, sbX, upY, SB_W, SB_AH)
+    setNextFillColor(uiLayer, 1,1,1,hovUp and 1 or 0.7)
+    setNextTextAlign(uiLayer, AlignH_Center, AlignV_Middle)
+    addText(uiLayer, smallfont, "^", sbX+SB_W*0.5, upY+SB_AH*0.5)
+
+    -- Down arrow button
+    local hovDn = hitTest(sbX, dnY, SB_W, SB_AH)
+    setNextFillColor(uiLayer, hovDn and 0.28 or 0.14, hovDn and 0.32 or 0.17, hovDn and 0.38 or 0.22, 1)
+    addBox(uiLayer, sbX, dnY, SB_W, SB_AH)
+    setNextFillColor(uiLayer, 1,1,1,hovDn and 1 or 0.7)
+    setNextTextAlign(uiLayer, AlignH_Center, AlignV_Middle)
+    addText(uiLayer, smallfont, "v", sbX+SB_W*0.5, dnY+SB_AH*0.5)
+end
+
+-- ── VIEW: HOME ───────────────────────────────────────────────
+function drawHome()
+    local headerCount = dataLoaded and dbCount or ((pendingDbCount >= 0) and pendingDbCount or dbCount)
+    local hdrH = drawHeader("SRT DB Manager ("..headerCount.." DBs)")
+
+    -- DBG toggle (small button, top-right of header, off by default)
+    local dbgW = 38; local dbgH = math.floor(ROW_H*0.65)
+    local dbgX = rx-dbgW-5; local dbgY = math.floor((hdrH-dbgH)*0.5)
+    setNextFillColor(uiLayer, debugEnabled and 0.05 or 0.04, debugEnabled and 0.28 or 0.08, debugEnabled and 0.05 or 0.04, 0.9)
+    addBox(uiLayer,dbgX,dbgY,dbgW,dbgH)
+    setNextStrokeColor(uiLayer, debugEnabled and GREEN[1] or 0.38, debugEnabled and GREEN[2] or 0.38, debugEnabled and GREEN[3] or 0.38, 1)
+    setNextStrokeWidth(uiLayer,1)
+    addBox(uiLayer,dbgX,dbgY,dbgW,dbgH)
+    setNextFillColor(uiLayer, debugEnabled and GREEN[1] or 0.48, debugEnabled and GREEN[2] or 0.48, debugEnabled and GREEN[3] or 0.48, 1)
+    setNextTextAlign(uiLayer,AlignH_Center,AlignV_Middle)
+    addText(uiLayer,smallfont,"DBG",dbgX+dbgW*0.5,dbgY+dbgH*0.5)
+
+    local searchY = hdrH+PAD
+    local searchH = ROW_H*1.2
+    local searchW = rx-PAD*2
+    setNextFillColor(uiLayer,1,1,1,0.6)
+    addBox(uiLayer,PAD,searchY,searchW,searchH)
+    local sActive = searchQuery ~= ""
+    setNextFillColor(uiLayer,0,0,0,0)
+    setNextStrokeColor(uiLayer,sActive and GOLD[1] or 0.4, sActive and GOLD[2] or 0.4, sActive and GOLD[3] or 0.45, 1)
+    setNextStrokeWidth(uiLayer,2)
+    addBox(uiLayer,PAD,searchY,searchW,searchH)
+    local searchLabel = sActive and ("Search: "..searchQuery) or "Click to search..."
+    setNextFillColor(uiLayer,1,1,1,1)
+    setNextTextAlign(uiLayer,AlignH_Left,AlignV_Middle)
+    addText(uiLayer,medfont,searchLabel,PAD+12,searchY+searchH*0.5)
+    if sActive then
+        drawButton(rx-PAD-70,searchY+4,66,searchH-8,"Clear",RED,smallfont)
+    end
+
+    local cardStartY = searchY+searchH+PAD
+    local cardW = math.min(220,(rx-PAD*3)/2)
+    local cardH = math.min(120,ROW_H*3)
+    local col = 0
+    local cy  = cardStartY-scrollY
+
+    for i, db in ipairs(dbData) do
+        local cx = PAD + col*(cardW+PAD)
+        if cy+cardH > cardStartY and cy < ry then
+            local isMatch = searchResults[i] and #searchResults[i] > 0
+            local isDim   = sActive and not isMatch
+            local hover   = hitTest(cx,cy,cardW,cardH)
+            local a       = isDim and 0.35 or 1.0
+
+            setNextFillColor(listLayer,0.75,0.75,0.75,isDim and 0.15 or 0.35)
+            addBox(listLayer,cx,cy,cardW,cardH)
+            setNextFillColor(listLayer,0,0,0,0)
+            if isMatch then
+                setNextStrokeColor(listLayer,GOLD[1],GOLD[2],GOLD[3],1)
+                setNextStrokeWidth(listLayer,3)
+            elseif hover then
+                setNextStrokeColor(listLayer,0.6,0.65,0.7,1)
+                setNextStrokeWidth(listLayer,2)
+            else
+                setNextStrokeColor(listLayer,0.3,0.35,0.4,0.8)
+                setNextStrokeWidth(listLayer,1)
+            end
+            addBox(listLayer,cx,cy,cardW,cardH)
+
+            local iconSize = math.floor(cardH*0.45)
+            local iconX    = cx+cardW*0.5-iconSize*0.5
+            local iconY    = cy+8
+            drawDBIcon(uiLayer, iconX, iconY, iconSize, a)
+
+            setNextFillColor(listLayer,1,1,1,a)
+            setNextTextAlign(listLayer,AlignH_Center,AlignV_Middle)
+            addText(listLayer,medfont,truncStr(db.name,18),cx+cardW*0.5,cy+cardH-26)
+
+            setNextFillColor(listLayer,0.7,0.75,0.8,isDim and 0.3 or 0.85)
+            setNextTextAlign(listLayer,AlignH_Center,AlignV_Middle)
+            addText(listLayer,smallfont,db.entryCount.." entries",cx+cardW*0.5,cy+cardH-10)
+
+            if isMatch then
+                local bx = cx+cardW-20; local by = cy+8
+                setNextFillColor(listLayer,GOLD[1],GOLD[2],GOLD[3],1)
+                addCircle(listLayer,bx,by+8,10)
+                setNextFillColor(listLayer,0,0,0,1)
+                setNextTextAlign(listLayer,AlignH_Center,AlignV_Middle)
+                addText(listLayer,smallfont,tostring(#searchResults[i]),bx,by+8)
+            end
+        end
+
+        col = col+1
+        if col >= 2 then col=0; cy=cy+cardH+PAD end
+    end
+
+    if not dataLoaded then
+        -- Slot detection tells the PB the DB count instantly at boot, long
+        -- before the full chunked data transfer finishes (which can take
+        -- several seconds) - show that count immediately instead of a
+        -- misleading "no databanks" state or a blank screen in the meantime.
+        local shownCount = (pendingDbCount >= 0) and pendingDbCount or dbCount
+        setNextFillColor(uiLayer,0.85,0.85,0.85,0.95)
+        setNextTextAlign(uiLayer,AlignH_Center,AlignV_Middle)
+        addText(uiLayer,medfont,
+            shownCount..(shownCount==1 and " Databank" or " Databanks").." connected - Loading Data",
+            rx*0.5,ry*0.5-40)
+        if loadingIcon then
+            local iconSize = 64
+            setNextFillColor(uiLayer,1,1,1,1)
+            addImage(uiLayer,loadingIcon,rx*0.5-iconSize*0.5,ry*0.5-iconSize*0.5+20,iconSize,iconSize)
+        end
+    elseif dbCount == 0 then
+        setNextFillColor(uiLayer,0.6,0.6,0.6,0.8)
+        setNextTextAlign(uiLayer,AlignH_Center,AlignV_Middle)
+        addText(uiLayer,medfont,"No databanks connected.",rx*0.5,ry*0.5)
+    end
+
+    if dbCount >= 2 then
+        drawButton(rx-PAD-130,ry-ROW_H-PAD,130,ROW_H,"Clone Mode",GOLD,medfont)
+    end
+
+    maxScrollY = math.max(0, math.ceil(dbCount/2)*(cardH+PAD)-(ry-cardStartY))
+end
+
+-- ── VIEW: LIST ───────────────────────────────────────────────
+function drawList()
+    local db = dbData[selectedDB]
+    if not db then view="home"; return end
+    local hdrH = drawHeader(db.name.." ("..db.entryCount.." entries)")
+    drawBackButton(hdrH+PAD)
+    local wipeLabel = wipeConfirm and "CONFIRM WIPE" or "Wipe All"
+    local wipeCol   = wipeConfirm and RED or {0.75,0.18,0.18,1}
+    drawButton(rx-PAD-210-SB_W, hdrH+PAD, 105, ROW_H, wipeLabel, wipeCol, smallfont)
+    drawButton(rx-PAD-100-SB_W, hdrH+PAD, 95,  ROW_H, "+ Add",   GREEN,   smallfont)
+
+    local listY  = hdrH+ROW_H+PAD*2
+    lastListY    = listY
+    local rowW   = rx-PAD*2-SB_W          -- leave SB_W for scrollbar
+    local keyColW = math.floor(rowW*0.38)
+    local valColX = PAD+keyColW+8
+    local valColW = rowW-keyColW-20
+
+    -- Compute maxScrollY early (used by scrollbar and drag logic)
+    maxScrollY = math.max(0, #db.entries*ROW_H-(ry-listY))
+
+    -- Column labels
+    setNextFillColor(uiLayer,GOLD[1]*0.7,GOLD[2]*0.7,GOLD[3]*0.7,0.8)
+    setNextTextAlign(uiLayer,AlignH_Left,AlignV_Middle)
+    addText(uiLayer,smallfont,"KEY",PAD+8,listY-ROW_H*0.5)
+    addText(uiLayer,smallfont,"VALUE",valColX,listY-ROW_H*0.5)
+    setNextStrokeColor(uiLayer,0.3,0.35,0.4,0.5)
+    setNextStrokeWidth(uiLayer,1)
+    addLine(uiLayer,PAD,listY-2,PAD+rowW,listY-2)
+
+    for i, entry in ipairs(db.entries) do
+        local ey = listY+(i-1)*ROW_H-scrollY
+        if ey+ROW_H > listY and ey < ry then
+            local hover = hitTest(PAD,ey,rowW,ROW_H)
+
+            setNextFillColor(listLayer,
+                hover and 0.18 or 0.1,
+                hover and 0.22 or 0.13,
+                hover and 0.28 or 0.16,
+                (i%2==0) and (hover and 1 or 0.7) or (hover and 1 or 0.45))
+            addBox(listLayer,PAD,ey,rowW,ROW_H)
+
+            local keyTrunc = truncStr(entry.key, math.floor(keyColW/8))
+            setNextFillColor(listLayer,CYAN[1],CYAN[2],CYAN[3],1)
+            setNextTextAlign(listLayer,AlignH_Left,AlignV_Middle)
+            addText(listLayer,medfont,keyTrunc,PAD+8,ey+ROW_H*0.5)
+
+            local sepX = PAD+keyColW
+            setNextStrokeColor(listLayer,0.3,0.35,0.4,0.5)
+            setNextStrokeWidth(listLayer,1)
+            addLine(listLayer,sepX,ey+4,sepX,ey+ROW_H-4)
+
+            local maxChars = math.max(4, math.floor(valColW/7))
+            local isTrunc  = #entry.value > maxChars
+            local valText  = truncStr(entry.value, maxChars)
+            setNextFillColor(listLayer,0.9,0.9,0.9,0.95)
+            setNextTextAlign(listLayer,AlignH_Left,AlignV_Middle)
+            addText(listLayer,smallfont,valText,valColX,ey+ROW_H*0.5)
+            if isTrunc then
+                setNextFillColor(listLayer,GOLD[1],GOLD[2],GOLD[3],0.9)
+                setNextTextAlign(listLayer,AlignH_Right,AlignV_Middle)
+                addText(listLayer,smallfont,">",PAD+rowW-4,ey+ROW_H*0.5)
+            end
+
+            local isSearchMatch = false
+            if searchResults[selectedDB] then
+                for _, mk in ipairs(searchResults[selectedDB]) do
+                    if mk == entry.key then isSearchMatch=true; break end
+                end
+            end
+            if isSearchMatch then
+                setNextStrokeColor(listLayer,GOLD[1],GOLD[2],GOLD[3],0.6)
+                setNextStrokeWidth(listLayer,1)
+                addBox(listLayer,PAD,ey,rowW,ROW_H)
+            end
+        end
+    end
+
+    drawScrollbar(listY)
+end
+
+-- ── VIEW: DETAIL ─────────────────────────────────────────────
+function drawDetail()
+    local db = dbData[selectedDB]
+    if not db then view="home"; return end
+    local title = isNewEntry and "New Entry" or "Edit Entry"
+    local hdrH  = drawHeader(title)
+    drawBackButton(hdrH+PAD)
+
+    local y      = hdrH+ROW_H+PAD*2
+    local labelW = 80
+    local fieldX = PAD+labelW+8
+    local fieldW = rx-fieldX-PAD
+
+    setNextFillColor(uiLayer,CYAN[1],CYAN[2],CYAN[3],1)
+    setNextTextAlign(uiLayer,AlignH_Left,AlignV_Middle)
+    addText(uiLayer,medfont,"Key:",PAD,y+ROW_H*0.5)
+    local keyEditing = (kbTarget == "editKey")
+    setNextFillColor(uiLayer,0.08,0.10,0.14,1)
+    addBox(uiLayer,fieldX,y,fieldW-70,ROW_H)
+    setNextStrokeColor(uiLayer,keyEditing and GOLD[1] or CYAN[1]*0.6, keyEditing and GOLD[2] or CYAN[2]*0.6, keyEditing and GOLD[3] or CYAN[3]*0.6,1)
+    setNextStrokeWidth(uiLayer,keyEditing and 2 or 1)
+    addBox(uiLayer,fieldX,y,fieldW-70,ROW_H)
+    setNextFillColor(uiLayer,1,1,1,1)
+    setNextTextAlign(uiLayer,AlignH_Left,AlignV_Middle)
+    addText(uiLayer,medfont,editKey,fieldX+8,y+ROW_H*0.5)
+    drawButton(fieldX+fieldW-62,y+2,58,ROW_H-4,"Edit",CYAN,smallfont)
+
+    y = y+ROW_H+PAD
+
+    setNextFillColor(uiLayer,CYAN[1],CYAN[2],CYAN[3],1)
+    setNextTextAlign(uiLayer,AlignH_Left,AlignV_Middle)
+    addText(uiLayer,medfont,"Value:",PAD,y+ROW_H*0.5)
+    local valEditing = (kbTarget == "editValue")
+    local valBoxH    = ROW_H*4
+    setNextFillColor(uiLayer,0.08,0.10,0.14,1)
+    addBox(uiLayer,fieldX,y,fieldW-70,valBoxH)
+    setNextStrokeColor(uiLayer,valEditing and GOLD[1] or CYAN[1]*0.6, valEditing and GOLD[2] or CYAN[2]*0.6, valEditing and GOLD[3] or CYAN[3]*0.6,1)
+    setNextStrokeWidth(uiLayer,valEditing and 2 or 1)
+    addBox(uiLayer,fieldX,y,fieldW-70,valBoxH)
+    setNextFillColor(uiLayer,0.9,0.9,0.9,1)
+    setNextTextAlign(uiLayer,AlignH_Left,AlignV_Top)
+    local valDisplay = editValue
+    if #valDisplay > 300 then valDisplay = valDisplay:sub(1,300)..".." end
+    addText(uiLayer,smallfont,valDisplay,fieldX+8,y+8)
+    drawButton(fieldX+fieldW-62,y+4,58,ROW_H-4,"Edit",CYAN,smallfont)
+
+    y = y+valBoxH+PAD*2
+
+    local btnW = math.floor((rx-PAD*4)/3)
+    drawButton(PAD,           y,btnW,ROW_H*1.5,"Save",   GREEN,    medfont)
+    drawButton(PAD*2+btnW,    y,btnW,ROW_H*1.5,"Delete", isNewEntry and DIM or RED,medfont)
+    drawButton(PAD*3+btnW*2,  y,btnW,ROW_H*1.5,"Cancel", DIM_WHITE,medfont)
+end
+
+-- ── VIEW: CLONE ──────────────────────────────────────────────
+function drawClone()
+    local hdrH = drawHeader("Clone DB")
+    local y    = hdrH+PAD
+    drawBackButton(y)
+    y = y+ROW_H+PAD
+
+    setNextFillColor(uiLayer,1,1,1,1)
+    setNextTextAlign(uiLayer,AlignH_Left,AlignV_Middle)
+    addText(uiLayer,medfont,"Source DB:",PAD,y+ROW_H*0.5)
+
+    local btnW = math.min(180,math.floor((rx-PAD*(#dbData+1))/#dbData))
+    for i,db in ipairs(dbData) do
+        local bx = PAD+(i-1)*(btnW+PAD)
+        if bx+btnW <= rx-PAD then
+            local col = (cloneSource==i) and GREEN or DIM
+            drawButton(bx,y+ROW_H+4,btnW,ROW_H,truncStr(db.name,14),col,smallfont)
+        end
+    end
+
+    y = y+ROW_H*2+PAD*2
+    setNextFillColor(uiLayer,1,1,1,1)
+    setNextTextAlign(uiLayer,AlignH_Left,AlignV_Middle)
+    addText(uiLayer,medfont,"Target DBs:",PAD,y)
+    y = y+ROW_H
+
+    for i,db in ipairs(dbData) do
+        if i ~= cloneSource then
+            local selected = cloneTargets[i]
+            local col = selected and GOLD or DIM
+            setNextFillColor(uiLayer,selected and 0.2 or 0.08,selected and 0.25 or 0.08,selected and 0.1 or 0.08,0.95)
+            addBox(uiLayer,PAD,y,20,ROW_H)
+            setNextStrokeColor(uiLayer,GOLD[1],GOLD[2],GOLD[3],selected and 1 or 0.4)
+            setNextStrokeWidth(uiLayer,2)
+            addBox(uiLayer,PAD,y,20,ROW_H)
+            if selected then
+                setNextFillColor(uiLayer,GOLD[1],GOLD[2],GOLD[3],1)
+                setNextTextAlign(uiLayer,AlignH_Center,AlignV_Middle)
+                addText(uiLayer,smallfont,"v",PAD+10,y+ROW_H*0.5)
+            end
+            drawButton(PAD+24,y,rx-PAD*2-24,ROW_H,db.name.." ("..db.entryCount.." entries)",col,smallfont)
+            y = y+ROW_H+4
+        end
+    end
+
+    y = y+PAD
+
+    local hw = math.floor((rx-PAD*4)/2)
+    drawButton(PAD+50,        y,hw,ROW_H,"Wipe targets first",cloneWipe and RED   or DIM,smallfont)
+    drawButton(PAD+50+hw+PAD, y,hw,ROW_H,"Merge (keep existing)", not cloneWipe and GREEN or DIM,smallfont)
+
+    y = y+ROW_H+PAD
+
+    local hasTargets = false
+    for _,v in pairs(cloneTargets) do if v then hasTargets=true; break end end
+
+    if not hasTargets then
+        setNextFillColor(uiLayer,0.5,0.5,0.5,0.5)
+        setNextTextAlign(uiLayer,AlignH_Center,AlignV_Middle)
+        addText(uiLayer,medfont,"Select at least one target DB",rx*0.5,y+ROW_H)
+    else
+        -- Full clone button
+        if cloneConfirm then
+            drawButton(PAD,y,rx-PAD*2,ROW_H*1.4,"CONFIRM CLONE — ALL DATA",RED,medfont)
+        else
+            drawButton(PAD,y,rx-PAD*2,ROW_H*1.4,"Clone All Data",GOLD,medfont)
+        end
+        y = y+ROW_H*1.4+PAD
+
+        -- Copy Locations Only button
+        if copyLocConfirm then
+            drawButton(PAD,y,rx-PAD*2,ROW_H*1.4,"CONFIRM — Copy ArchHUD Locations",RED,medfont)
+        else
+            drawButton(PAD,y,rx-PAD*2,ROW_H*1.4,"Copy ArchHUD Locations Only",CYAN,medfont)
+        end
+        y = y+ROW_H*1.4+PAD
+
+        -- Clone Individual Items button
+        drawButton(PAD,y,rx-PAD*2,ROW_H,"Clone Individual Items...",DIM_WHITE,smallfont)
+    end
+end
+
+-- ── VIEW: KEYBOARD ───────────────────────────────────────────
+local kbLetterRows = {
+    {"q","w","e","r","t","y","u","i","o","p"},
+    {"a","s","d","f","g","h","j","k","l"},
+    {"z","x","c","v","b","n","m"},
+}
+local kbShiftRows = {
+    {"Q","W","E","R","T","Y","U","I","O","P"},
+    {"A","S","D","F","G","H","J","K","L"},
+    {"Z","X","C","V","B","N","M"},
+}
+local kbNumRows = {
+    {"1","2","3","4","5","6","7","8","9","0"},
+    {"-","_","=","+","(",")","{","}","[","]"},
+    {"/","\\",":",";","@","#","$","%","^","&"},
+    {"*","~","`","'","\"","<",">",",",".","!"},
+}
+
+-- Helper: compute bottom-row button layout (5 keys, fits any resolution)
+function kbBottomLayout()
+    local totalW   = rx - KB_PAD*2
+    local avail    = totalW - 4*KB_MRG  -- 4 gaps between 5 buttons
+    local u        = avail / 7.5
+    local shiftW   = math.floor(u * 1.2)
+    local numW     = math.floor(u * 1.2)
+    local spaceW   = math.floor(u * 2.8)
+    local delW     = math.floor(u * 1.0)
+    local enterW   = avail - shiftW - numW - spaceW - delW
+    local x1 = KB_PAD
+    local x2 = x1 + shiftW + KB_MRG
+    local x3 = x2 + numW   + KB_MRG
+    local x4 = x3 + spaceW + KB_MRG
+    local x5 = x4 + delW   + KB_MRG
+    return shiftW,numW,spaceW,delW,enterW, x1,x2,x3,x4,x5
+end
+
+function drawKeyboard()
+    setNextFillColor(overlayLayer,0,0,0,0.78)
+    addBox(overlayLayer,0,0,rx,ry)
+
+    local kbH      = ry*0.62
+    local kbY      = ry-kbH
+    local keyMargin= KB_MRG
+
+    -- Input display area
+    local dispH   = ROW_H*1.8
+    local dispY   = kbY-dispH-PAD
+    local cancelW = 74
+
+    -- Cancel button (top-right of display)
+    local hovCancel = hitTest(rx-PAD-cancelW, dispY+4, cancelW, ROW_H)
+    setNextFillColor(overlayLayer, hovCancel and 0.5 or 0.3, hovCancel and 0.1 or 0.05, hovCancel and 0.1 or 0.05, 0.95)
+    addBox(overlayLayer,rx-PAD-cancelW,dispY+4,cancelW,ROW_H)
+    setNextStrokeColor(overlayLayer,RED[1],RED[2],RED[3],1); setNextStrokeWidth(overlayLayer,2)
+    addBox(overlayLayer,rx-PAD-cancelW,dispY+4,cancelW,ROW_H)
+    setNextFillColor(overlayLayer,1,1,1,1)
+    setNextTextAlign(overlayLayer,AlignH_Center,AlignV_Middle)
+    addText(overlayLayer,smallfont,"Cancel",rx-PAD-cancelW+cancelW*0.5,dispY+4+ROW_H*0.5)
+
+    -- Input box
+    local dispBoxW = rx-PAD*2-cancelW-PAD
+    setNextFillColor(overlayLayer,0.08,0.10,0.14,1)
+    addBox(overlayLayer,PAD,dispY,dispBoxW,dispH)
+    setNextStrokeColor(overlayLayer,GOLD[1],GOLD[2],GOLD[3],1); setNextStrokeWidth(overlayLayer,2)
+    addBox(overlayLayer,PAD,dispY,dispBoxW,dispH)
+    setNextFillColor(overlayLayer,1,1,1,1)
+    setNextTextAlign(overlayLayer,AlignH_Left,AlignV_Middle)
+    local displayText = kbText
+    if #displayText > 50 then displayText = ".."..displayText:sub(#displayText-47) end
+    addText(overlayLayer,medfont,displayText.."|",PAD+10,dispY+dispH*0.5)
+
+    -- Label showing what field is being edited
+    local targetLabel = kbTarget=="search" and "Search" or kbTarget=="editKey" and "Key" or "Value"
+    setNextFillColor(overlayLayer,GOLD[1],GOLD[2],GOLD[3],0.7)
+    setNextTextAlign(overlayLayer,AlignH_Left,AlignV_Top)
+    addText(overlayLayer,smallfont,targetLabel,PAD+4,dispY+2)
+
+    -- Keyboard background
+    setNextFillColor(overlayLayer,0.05,0.07,0.09,1)
+    addBox(overlayLayer,0,kbY,rx,kbH)
+
+    -- Select row set
+    local rows = kbSpecial and kbNumRows or (kbShift and kbShiftRows or kbLetterRows)
+    local numRows    = #rows
+    local bottomRowH = math.floor(ROW_H*1.15)
+    local totalKeyH  = math.floor((kbH-KB_PAD*2-bottomRowH-KB_MRG)/numRows)
+    local keyH       = math.max(22, totalKeyH)
+    local totalW     = rx - KB_PAD*2
+
+    for ri, row in ipairs(rows) do
+        local keyW   = math.floor((totalW-(#row+1)*KB_MRG)/#row)
+        local rowWid = #row*(keyW+KB_MRG)
+        local startX = math.floor((rx-rowWid)*0.5)
+        local ky     = kbY+KB_PAD+(ri-1)*(keyH+KB_MRG)
+        for ki, ch in ipairs(row) do
+            local kx    = startX+(ki-1)*(keyW+KB_MRG)
+            local hover = hitTest(kx,ky,keyW,keyH)
+            setNextFillColor(overlayLayer,hover and 0.30 or 0.14,hover and 0.32 or 0.16,hover and 0.36 or 0.20,1)
+            addBox(overlayLayer,kx,ky,keyW,keyH)
+            setNextStrokeColor(overlayLayer,0.4,0.42,0.48,0.6)
+            setNextStrokeWidth(overlayLayer,1)
+            addBox(overlayLayer,kx,ky,keyW,keyH)
+            setNextFillColor(overlayLayer,1,1,1,1)
+            setNextTextAlign(overlayLayer,AlignH_Center,AlignV_Middle)
+            addText(overlayLayer,keyfont,ch,kx+keyW*0.5,ky+keyH*0.5)
+        end
+    end
+
+    -- Bottom control row — MUST use overlayLayer directly; drawButton uses uiLayer which is hidden under overlay
+    local bottomY = kbY+KB_PAD+numRows*(keyH+KB_MRG)+KB_MRG
+    local shiftW,numW,spaceW,delW,enterW, x1,x2,x3,x4,x5 = kbBottomLayout()
+
+    local function kbBtn(bx,by,bw,bh,label,cr,cg,cb,fnt2)
+        local hov = hitTest(bx,by,bw,bh)
+        setNextFillColor(overlayLayer, hov and cr*0.4 or 0.16, hov and cg*0.4 or 0.18, hov and cb*0.4 or 0.22, 0.97)
+        addBox(overlayLayer,bx,by,bw,bh)
+        setNextStrokeColor(overlayLayer,cr,cg,cb,1)
+        setNextStrokeWidth(overlayLayer,2)
+        addBox(overlayLayer,bx,by,bw,bh)
+        setNextFillColor(overlayLayer,cr,cg,cb,1)
+        setNextTextAlign(overlayLayer,AlignH_Center,AlignV_Middle)
+        addText(overlayLayer,fnt2 or smallfont,label,bx+bw*0.5,by+bh*0.5)
+    end
+
+    local shiftActive = (not kbSpecial) and kbShift
+    local shiftLabel  = kbSpecial and "ABC" or (kbShift and "abc" or "ABC")
+    local sR = shiftActive and GOLD[1] or 0.72
+    local sG = shiftActive and GOLD[2] or 0.72
+    local sB = shiftActive and GOLD[3] or 0.72
+    kbBtn(x1,bottomY,shiftW,bottomRowH, shiftLabel, sR,sG,sB)
+
+    local numLabel = kbSpecial and "abc" or "!?#"
+    local nR = kbSpecial and GOLD[1] or 0.72
+    local nG = kbSpecial and GOLD[2] or 0.72
+    local nB = kbSpecial and GOLD[3] or 0.72
+    kbBtn(x2,bottomY,numW,bottomRowH, numLabel, nR,nG,nB)
+
+    kbBtn(x3,bottomY,spaceW,bottomRowH, "Space",   1,   1,   1)
+    kbBtn(x4,bottomY,delW,  bottomRowH, "Del",     RED[1],RED[2],RED[3])
+
+    local enterLabel = (kbTarget=="search") and "SEARCH" or "ENTER"
+    kbBtn(x5,bottomY,enterW,bottomRowH, enterLabel, GREEN[1],GREEN[2],GREEN[3], medfont)
+end
+
+-- ── VIEW: CLONE INDIVIDUAL ITEMS ─────────────────────────────
+function drawCloneItems()
+    local db = dbData[cloneSource]
+    if not db then view="clone"; return end
+
+    local selCount = 0
+    for _,v in pairs(cloneItemSelections) do if v then selCount=selCount+1 end end
+
+    local targets={}
+    for idx,sel in pairs(cloneTargets) do if sel and dbData[idx] then targets[#targets+1]=idx end end
+
+    local hdrH = drawHeader("Select Items — "..db.name.." ("..#db.entries.." items)")
+    local y    = hdrH+PAD
+
+    drawBackButton(y)
+    drawButton(rx-PAD-160-SB_W, y, 75, ROW_H, "All",  GREEN, smallfont)
+    drawButton(rx-PAD-80-SB_W,  y, 75, ROW_H, "None", RED,   smallfont)
+    y = y+ROW_H+PAD
+
+    -- Info bar: targets
+    local tNames = {}
+    for _,idx in ipairs(targets) do tNames[#tNames+1] = dbData[idx].name end
+    local info = "Copy to: "..(#tNames>0 and table.concat(tNames,", ") or "(no targets)")
+    setNextFillColor(uiLayer, CYAN[1],CYAN[2],CYAN[3],0.7)
+    setNextTextAlign(uiLayer, AlignH_Left, AlignV_Middle)
+    addText(uiLayer, smallfont, info, PAD, y+ROW_H*0.5)
+    y = y+ROW_H+4
+
+    -- Column labels
+    local rowW  = rx-PAD*2-SB_W
+    local cbW   = 22
+    local keyColW = math.floor((rowW-cbW)*0.40)
+    local valColX = PAD+cbW+keyColW+8
+    setNextFillColor(uiLayer, GOLD[1]*0.7,GOLD[2]*0.7,GOLD[3]*0.7,0.8)
+    setNextTextAlign(uiLayer, AlignH_Left, AlignV_Middle)
+    addText(uiLayer, smallfont, "KEY",   PAD+cbW+4, y)
+    addText(uiLayer, smallfont, "VALUE", valColX,   y)
+    setNextStrokeColor(uiLayer, 0.3,0.35,0.4,0.5)
+    setNextStrokeWidth(uiLayer, 1)
+    addLine(uiLayer, PAD, y+14, PAD+rowW, y+14)
+    y = y+18
+
+    local listY = y
+    lastListY   = listY
+    local footH = selCount>0 and ROW_H*1.4+PAD*2 or PAD
+    maxScrollY  = math.max(0, #db.entries*ROW_H - (ry-listY-footH))
+
+    for i, entry in ipairs(db.entries) do
+        local ey = listY+(i-1)*ROW_H-scrollY
+        if ey+ROW_H > listY and ey < ry-footH then
+            local sel   = cloneItemSelections[entry.key]
+            local hover = hitTest(PAD,ey,rowW,ROW_H)
+
+            local bgR = sel and 0.18 or (hover and 0.16 or (i%2==0 and 0.10 or 0.07))
+            local bgG = sel and 0.28 or (hover and 0.20 or (i%2==0 and 0.13 or 0.09))
+            local bgB = sel and 0.18 or (hover and 0.24 or (i%2==0 and 0.16 or 0.11))
+            setNextFillColor(listLayer,bgR,bgG,bgB,0.97)
+            addBox(listLayer,PAD,ey,rowW,ROW_H)
+            if sel then
+                setNextStrokeColor(listLayer,GOLD[1],GOLD[2],GOLD[3],0.65)
+                setNextStrokeWidth(listLayer,1)
+                addBox(listLayer,PAD,ey,rowW,ROW_H)
+            end
+
+            -- Checkbox
+            local cbSz = math.floor(ROW_H*0.52)
+            local cbX  = PAD+3
+            local cbY  = ey+math.floor((ROW_H-cbSz)*0.5)
+            setNextFillColor(listLayer, sel and 0.1 or 0.07, sel and 0.38 or 0.09, sel and 0.1 or 0.09, 1)
+            addBox(listLayer,cbX,cbY,cbSz,cbSz)
+            setNextStrokeColor(listLayer, sel and GOLD[1] or 0.45, sel and GOLD[2] or 0.45, sel and GOLD[3] or 0.45, 1)
+            setNextStrokeWidth(listLayer,1)
+            addBox(listLayer,cbX,cbY,cbSz,cbSz)
+            if sel then
+                setNextFillColor(listLayer,GOLD[1],GOLD[2],GOLD[3],1)
+                setNextTextAlign(listLayer,AlignH_Center,AlignV_Middle)
+                addText(listLayer,smallfont,"v",cbX+cbSz*0.5,cbY+cbSz*0.5)
+            end
+
+            -- Key
+            local keyT = truncStr(entry.key, math.floor(keyColW/8))
+            setNextFillColor(listLayer, sel and 1.0 or CYAN[1], sel and 0.85 or CYAN[2], sel and 0.3 or CYAN[3], 1)
+            setNextTextAlign(listLayer,AlignH_Left,AlignV_Middle)
+            addText(listLayer,medfont,keyT,PAD+cbW+4,ey+ROW_H*0.5)
+
+            setNextStrokeColor(listLayer,0.3,0.35,0.4,0.4)
+            setNextStrokeWidth(listLayer,1)
+            addLine(listLayer,PAD+cbW+keyColW,ey+4,PAD+cbW+keyColW,ey+ROW_H-4)
+
+            -- Value
+            local maxC = math.max(4, math.floor((rowW-cbW-keyColW-12)/7))
+            setNextFillColor(listLayer,0.85,0.85,0.85,0.9)
+            setNextTextAlign(listLayer,AlignH_Left,AlignV_Middle)
+            addText(listLayer,smallfont,truncStr(entry.value,maxC),valColX,ey+ROW_H*0.5)
+        end
+    end
+
+    drawScrollbar(listY)
+
+    -- Footer
+    if selCount>0 then
+        local confY = ry-ROW_H*1.4-PAD
+        local label = "Copy "..selCount.." item"..(selCount>1 and "s" or "").." to "..#targets.." DB"..(#targets>1 and "s" or "")
+        drawButton(PAD,confY,rx-PAD*2-SB_W,ROW_H*1.4,label,GREEN,medfont)
+    else
+        setNextFillColor(uiLayer,0.5,0.5,0.5,0.45)
+        setNextTextAlign(uiLayer,AlignH_Center,AlignV_Middle)
+        addText(uiLayer,smallfont,"Tap rows to select items",rx*0.5,ry-ROW_H*0.7)
+    end
+end
+
+function clickCloneItems()
+    local db = dbData[cloneSource]
+    if not db then return end
+
+    local hdrH = ROW_H*1.5
+    local y    = hdrH+PAD
+
+    if hitTest(PAD,y,90,ROW_H) then view="clone"; scrollY=0; return end
+    if hitTest(rx-PAD-160-SB_W,y,75,ROW_H) then
+        for _,e in ipairs(db.entries) do cloneItemSelections[e.key]=true end; return
+    end
+    if hitTest(rx-PAD-80-SB_W,y,75,ROW_H) then
+        cloneItemSelections={}; return
+    end
+    y = y+ROW_H+PAD   -- info bar
+    y = y+ROW_H+4
+    y = y+18          -- column labels
+
+    local listY = y
+    local rowW  = rx-PAD*2-SB_W
+    local footH = ROW_H*1.4+PAD*2
+
+    local selCount=0
+    for _,v in pairs(cloneItemSelections) do if v then selCount=selCount+1 end end
+
+    -- Scrollbar clicks
+    if maxScrollY>0 then
+        local sbX,sbTY,sbH,thH,thY = getScrollbarGeom(listY)
+        local upY=listY; local dnY=ry-SB_AH
+        if hitTest(sbX,upY,SB_W,SB_AH) then scrollY=clamp(scrollY-ROW_H,0,maxScrollY); return end
+        if hitTest(sbX,dnY,SB_W,SB_AH) then scrollY=clamp(scrollY+ROW_H,0,maxScrollY); return end
+        if hitTest(sbX,sbTY,SB_W,sbH) and not hitTest(sbX,thY,SB_W,thH) then
+            scrollY=clamp(math.floor(clamp((my-sbTY)/sbH,0,1)*maxScrollY),0,maxScrollY); return
+        end
+    end
+
+    -- Confirm button
+    if selCount>0 then
+        local confY=ry-ROW_H*1.4-PAD
+        if hitTest(PAD,confY,rx-PAD*2-SB_W,ROW_H*1.4) then
+            local keys={}; for k,v in pairs(cloneItemSelections) do if v then keys[#keys+1]=k end end
+            local targets={}; for idx,sel in pairs(cloneTargets) do if sel then targets[#targets+1]=idx end end
+            sendCommand({action="cloneItems",sourceIndex=cloneSource,targets=targets,keys=keys})
+            view="home"; return
+        end
+    end
+
+    -- Row toggles
+    local clipH = selCount>0 and footH or PAD
+    for i,entry in ipairs(db.entries) do
+        local ey=listY+(i-1)*ROW_H-scrollY
+        if ey+ROW_H>listY and ey<ry-clipH then
+            if hitTest(PAD,ey,rowW,ROW_H) then
+                if cloneItemSelections[entry.key] then
+                    cloneItemSelections[entry.key]=nil
+                else
+                    cloneItemSelections[entry.key]=true
+                end
+                return
+            end
+        end
+    end
+end
+
+-- ── CLICK HANDLERS ───────────────────────────────────────────
+function handleClick()
+    if     view=="home"        then clickHome()
+    elseif view=="list"        then clickList()
+    elseif view=="detail"      then clickDetail()
+    elseif view=="clone"       then clickClone()
+    elseif view=="cloneItems"  then clickCloneItems()
+    elseif view=="keyboard"    then clickKeyboard()
+    end
+end
+
+function clickHome()
+    local hdrH    = ROW_H*1.5
+    -- DBG toggle
+    local dbgW = 38; local dbgH = math.floor(ROW_H*0.65)
+    local dbgX = rx-dbgW-5; local dbgY = math.floor((hdrH-dbgH)*0.5)
+    if hitTest(dbgX,dbgY,dbgW,dbgH) then debugEnabled=not debugEnabled; return end
+
+    local searchY = hdrH+PAD
+    local searchH = ROW_H*1.2
+    local searchW = rx-PAD*2
+
+    if hitTest(PAD,searchY,searchW,searchH) then
+        kbTarget="search"; kbText=searchQuery; view="keyboard"; return
+    end
+    if searchQuery~="" and hitTest(rx-PAD-70,searchY+4,66,searchH-8) then
+        sendCommand({action="clearSearch"}); searchQuery=""; searchResults={}; return
+    end
+
+    local cardStartY = searchY+searchH+PAD
+    local cardW = math.min(220,(rx-PAD*3)/2)
+    local cardH = math.min(120,ROW_H*3)
+    local col=0; local cy=cardStartY-scrollY
+
+    for i,db in ipairs(dbData) do
+        local cx = PAD+col*(cardW+PAD)
+        if cy+cardH>cardStartY and cy<ry then
+            if hitTest(cx,cy,cardW,cardH) then
+                selectedDB=i; scrollY=0; wipeConfirm=false; view="list"; return
+            end
+        end
+        col=col+1; if col>=2 then col=0; cy=cy+cardH+PAD end
+    end
+
+    if dbCount>=2 and hitTest(rx-PAD-130,ry-ROW_H-PAD,130,ROW_H) then
+        cloneSource=1; cloneTargets={}; cloneWipe=false; cloneConfirm=false
+        copyLocConfirm=false; scrollY=0; view="clone"
+    end
+end
+
+function clickList()
+    local hdrH  = ROW_H*1.5
+    local listY = hdrH+ROW_H+PAD*2
+    local rowW  = rx-PAD*2-SB_W
+
+    -- Back button
+    if hitTest(PAD,hdrH+PAD,90,ROW_H) then view="home"; scrollY=0; wipeConfirm=false; return end
+
+    -- Wipe All button
+    if hitTest(rx-PAD-210-SB_W, hdrH+PAD, 105, ROW_H) then
+        if wipeConfirm then
+            sendCommand({action="wipeDB", dbIndex=selectedDB})
+            wipeConfirm=false; view="home"; scrollY=0
+        else
+            wipeConfirm=true
+        end
+        return
+    end
+
+    -- Add button
+    if hitTest(rx-PAD-100-SB_W,hdrH+PAD,95,ROW_H) then
+        editKey=""; editValue=""; selectedKey=""; isNewEntry=true; view="detail"; return
+    end
+
+    -- Scrollbar interactions
+    if maxScrollY > 0 then
+        local sbX, sbTY, sbH, thH, thY = getScrollbarGeom(listY)
+        local upY = listY
+        local dnY = ry - SB_AH
+        if hitTest(sbX, upY, SB_W, SB_AH) then
+            scrollY = clamp(scrollY-ROW_H, 0, maxScrollY); return
+        end
+        if hitTest(sbX, dnY, SB_W, SB_AH) then
+            scrollY = clamp(scrollY+ROW_H, 0, maxScrollY); return
+        end
+        -- Click on track (not thumb) → jump
+        if hitTest(sbX, sbTY, SB_W, sbH) and not hitTest(sbX, thY, SB_W, thH) then
+            local frac = clamp((my - sbTY) / sbH, 0, 1)
+            scrollY = clamp(math.floor(frac * maxScrollY), 0, maxScrollY); return
+        end
+    end
+
+    -- Entry rows
+    local db = dbData[selectedDB]
+    if not db then return end
+    for i,entry in ipairs(db.entries) do
+        local ey = listY+(i-1)*ROW_H-scrollY
+        if ey+ROW_H>listY and ey<ry then
+            if hitTest(PAD,ey,rowW,ROW_H) then
+                editKey=entry.key; editValue=entry.value; selectedKey=entry.key
+                isNewEntry=false; view="detail"; return
+            end
+        end
+    end
+end
+
+function clickDetail()
+    local hdrH   = ROW_H*1.5
+    local y      = hdrH+ROW_H+PAD*2
+    local labelW = 80
+    local fieldX = PAD+labelW+8
+    local fieldW = rx-fieldX-PAD
+
+    if hitTest(PAD,hdrH+PAD,90,ROW_H) then view="list"; scrollY=0; return end
+
+    if hitTest(fieldX+fieldW-62,y+2,58,ROW_H-4) then
+        kbTarget="editKey"; kbText=editKey; view="keyboard"; return
+    end
+    y = y+ROW_H+PAD
+
+    local valBoxH = ROW_H*4
+    if hitTest(fieldX+fieldW-62,y+4,58,ROW_H-4) then
+        kbTarget="editValue"; kbText=editValue; view="keyboard"; return
+    end
+    y = y+valBoxH+PAD*2
+
+    local btnW = math.floor((rx-PAD*4)/3)
+
+    if hitTest(PAD,y,btnW,ROW_H*1.5) then
+        if editKey ~= "" then
+            if isNewEntry then
+                sendCommand({action="addEntry",  dbIndex=selectedDB, key=editKey, value=editValue})
+            else
+                if selectedKey ~= editKey then
+                    sendCommand({action="editKey", dbIndex=selectedDB, oldKey=selectedKey, newKey=editKey})
+                end
+                sendCommand({action="editEntry", dbIndex=selectedDB, key=editKey, value=editValue})
+            end
+        end
+        view="list"; return
+    end
+    if hitTest(PAD*2+btnW,y,btnW,ROW_H*1.5) then
+        if not isNewEntry and selectedKey~="" then
+            sendCommand({action="deleteEntry", dbIndex=selectedDB, key=selectedKey})
+        end
+        view="list"; return
+    end
+    if hitTest(PAD*3+btnW*2,y,btnW,ROW_H*1.5) then
+        view="list"; return
+    end
+end
+
+function clickClone()
+    local hdrH = ROW_H*1.5
+    if hitTest(PAD,hdrH+PAD,90,ROW_H) then view="home"; scrollY=0; return end
+
+    local y    = hdrH+PAD+ROW_H+PAD
+    local btnW = math.min(180,math.floor((rx-PAD*(#dbData+1))/#dbData))
+    for i,db in ipairs(dbData) do
+        local bx = PAD+(i-1)*(btnW+PAD)
+        if bx+btnW <= rx-PAD then
+            if hitTest(bx,y+ROW_H+4,btnW,ROW_H) then
+                cloneSource=i; cloneTargets={}; cloneConfirm=false; copyLocConfirm=false; return
+            end
+        end
+    end
+
+    y = y+ROW_H*2+PAD*2
+    y = y+ROW_H  -- "Target DBs:" label row (matches drawClone layout)
+    -- Target toggles
+    for i,db in ipairs(dbData) do
+        if i~=cloneSource then
+            if hitTest(PAD,y,rx-PAD*2,ROW_H) then
+                cloneTargets[i]=not cloneTargets[i]; cloneConfirm=false; copyLocConfirm=false; return
+            end
+            y = y+ROW_H+4
+        end
+    end
+
+    y = y+PAD
+    local hw = math.floor((rx-PAD*4)/2)
+    if hitTest(PAD+50,y,hw,ROW_H) then cloneWipe=true;  cloneConfirm=false; return end
+    if hitTest(PAD+50+hw+PAD,y,hw,ROW_H) then cloneWipe=false; cloneConfirm=false; return end
+
+    y = y+ROW_H+PAD
+
+    local hasTargets = false
+    for _,v in pairs(cloneTargets) do if v then hasTargets=true; break end end
+    if not hasTargets then return end
+
+    -- Clone All Data button
+    if hitTest(PAD,y,rx-PAD*2,ROW_H*1.4) then
+        if cloneConfirm then
+            local targets={}
+            for idx,sel in pairs(cloneTargets) do if sel then targets[#targets+1]=idx end end
+            sendCommand({action="clone", sourceIndex=cloneSource, targets=targets, wipeFirst=cloneWipe})
+            cloneConfirm=false; copyLocConfirm=false; view="home"
+        else
+            cloneConfirm=true; copyLocConfirm=false
+        end
+        return
+    end
+    y = y+ROW_H*1.4+PAD
+
+    -- Copy Locations Only button
+    if hitTest(PAD,y,rx-PAD*2,ROW_H*1.4) then
+        if copyLocConfirm then
+            local targets={}
+            for idx,sel in pairs(cloneTargets) do if sel then targets[#targets+1]=idx end end
+            sendCommand({action="copyLocations", sourceIndex=cloneSource, targets=targets})
+            copyLocConfirm=false; cloneConfirm=false; view="home"
+        else
+            copyLocConfirm=true; cloneConfirm=false
+        end
+        return
+    end
+    y = y+ROW_H*1.4+PAD
+
+    -- Clone Individual Items
+    if hitTest(PAD,y,rx-PAD*2,ROW_H) then
+        cloneItemSelections={}; scrollY=0; view="cloneItems"; return
+    end
+end
+
+function clickKeyboard()
+    local kbH      = ry*0.62
+    local kbY      = ry-kbH
+    local dispH    = ROW_H*1.8
+    local dispY    = kbY-dispH-PAD
+    local cancelW  = 74
+
+    -- Cancel in display area
+    if hitTest(rx-PAD-cancelW,dispY+4,cancelW,ROW_H) then
+        kbShift=false; kbSpecial=false
+        view=(kbTarget=="search") and "home" or "detail"; return
+    end
+
+    local rows = kbSpecial and kbNumRows or (kbShift and kbShiftRows or kbLetterRows)
+    local numRows    = #rows
+    local bottomRowH = math.floor(ROW_H*1.15)
+    local totalKeyH  = math.floor((kbH-KB_PAD*2-bottomRowH-KB_MRG)/numRows)
+    local keyH       = math.max(22, totalKeyH)
+    local totalW     = rx - KB_PAD*2
+
+    -- Letter/number rows
+    for ri, row in ipairs(rows) do
+        local keyW   = math.floor((totalW-(#row+1)*KB_MRG)/#row)
+        local rowWid = #row*(keyW+KB_MRG)
+        local startX = math.floor((rx-rowWid)*0.5)
+        local ky     = kbY+KB_PAD+(ri-1)*(keyH+KB_MRG)
+        for ki, ch in ipairs(row) do
+            local kx = startX+(ki-1)*(keyW+KB_MRG)
+            if hitTest(kx,ky,keyW,keyH) then
+                kbText=kbText..ch; return
+            end
+        end
+    end
+
+    -- Bottom row
+    local bottomY = kbY+KB_PAD+numRows*(keyH+KB_MRG)+KB_MRG
+    local shiftW,numW,spaceW,delW,enterW, x1,x2,x3,x4,x5 = kbBottomLayout()
+
+    if hitTest(x1,bottomY,shiftW,bottomRowH) then
+        if kbSpecial then kbSpecial=false; kbShift=false
+        else kbShift=not kbShift end
+        return
+    end
+    if hitTest(x2,bottomY,numW,bottomRowH) then
+        kbSpecial=not kbSpecial; kbShift=false; return
+    end
+    if hitTest(x3,bottomY,spaceW,bottomRowH) then kbText=kbText.." "; return end
+    if hitTest(x4,bottomY,delW,bottomRowH) then
+        if #kbText>0 then kbText=kbText:sub(1,#kbText-1) end; return
+    end
+    if hitTest(x5,bottomY,enterW,bottomRowH) then
+        if kbTarget=="search" then
+            searchQuery=kbText
+            sendCommand({action="search", query=kbText})
+        elseif kbTarget=="editKey" then
+            editKey=kbText
+        elseif kbTarget=="editValue" then
+            editValue=kbText
+        end
+        kbShift=false; kbSpecial=false
+        view=(kbTarget=="search") and "home" or "detail"; return
+    end
+end
+
+-- ── MAIN RENDER LOOP ─────────────────────────────────────────
+setFrames()
+
+mx, my  = getCursor()
+down    = getCursorDown()
+release = getCursorReleased()
+
+-- ── Chunked data reception ────────────────────────────────────
+local rawInput = getInput()
+if rawInput and rawInput~="" and rawInput~=lastInput then
+    lastInput = rawInput
+    local ok2,msg = pcall(json.decode,rawInput)
+    if ok2 and msg then
+        -- Wheel delta piggybacked on any message from PB
+        local wh = msg.wh
+        if wh and wh ~= 0 then
+            lastWheelDbg = wh
+            if view=="list" or view=="home" or view=="cloneItems" then
+                scrollY = clamp(scrollY - wh * ROW_H * 2, 0, maxScrollY)
+            end
+        end
+        if msg.t=="boot" then
+            -- Sent immediately at PB boot, well before the full chunked
+            -- transfer (which can take several seconds) - slot detection
+            -- already knows the DB count synchronously, so show that
+            -- right away instead of a stale "no databanks" state.
+            pendingDbCount = msg.numDb or 0
+            if msg.bg and msg.bg ~= "" then bgImageUrl = msg.bg end
+        elseif msg.t=="hdr" then
+            recvSession  = msg.s
+            recvExpected = msg.n
+            recvChunks   = {}
+            recvGotCount = 0
+        elseif msg.t=="c" and msg.s==recvSession then
+            local idx = msg.i
+            recvChunks[idx] = msg.d
+            recvGotCount    = recvGotCount+1
+            if recvGotCount >= recvExpected then
+                local fullStr = ""
+                for ci=1,recvExpected do fullStr=fullStr..(recvChunks[ci] or "") end
+                local ok3,inputData = pcall(json.decode,fullStr)
+                if ok3 and inputData and inputData.databases then
+                    dbData        = inputData.databases
+                    dbCount       = #dbData
+                    dataLoaded    = true
+                    searchQuery   = inputData.searchQuery or ""
+                    searchResults = inputData.searchResults or {}
+                end
+            end
+        end
+    end
+end
+
+local DATABANK_ICON_HARD = "resources_generated/elements/transformers/transformer-databank_001/icons/env_transformer-databank_001_icon.png"
+dbIconHard = loadImage(DATABANK_ICON_HARD)
+
+-- Only fetched while actually shown (the loading screen, before dataLoaded)
+-- rather than every frame forever - an unconditional loadImage() here
+-- competed with dbIconHard's own every-frame load above and stopped the
+-- DB icon from ever finishing loading.
+if not dataLoaded then
+    local LOADING_ICON_URL = "https://du-front.thethirdverse.net/image/8db773cef94dbc80ba8c95c01225a45947d33dd2-%5BCITYPNG.COM%5DRound%20Loading%20Circle%20Orange%20Icon%20PNG%20-%20800x800.png"
+    loadingIcon = loadImage(LOADING_ICON_URL)
+end
+
+-- ── Drag / scroll logic ───────────────────────────────────────
+local justPressed = down and not prevDown
+prevDown = down
+
+local wasDragging = scrollDragActive or contentDragActive
+
+if (view == "list" or view == "cloneItems") and lastListY > 0 then
+    if justPressed then
+        if maxScrollY > 0 then
+            local sbX, sbTY, sbH, thH, thY = getScrollbarGeom(lastListY)
+            if hitTest(sbX, thY, SB_W, thH) then
+                -- Start scrollbar thumb drag
+                scrollDragActive        = true
+                scrollDragStartY        = my
+                scrollDragStartScrollY  = scrollY
+                contentDragActive       = false
+            elseif hitTest(PAD, lastListY, rx-PAD*2-SB_W, ry-lastListY) then
+                -- Start content drag
+                contentDragActive       = true
+                contentDragStartY       = my
+                contentDragStartScrollY = scrollY
+                scrollDragActive        = false
+            end
+        end
+    end
+
+    if down then
+        if scrollDragActive and maxScrollY > 0 then
+            local sbX, sbTY, sbH, thH, thY = getScrollbarGeom(lastListY)
+            local trackH = sbH - thH
+            if trackH > 0 then
+                local dy = my - scrollDragStartY
+                scrollY = clamp(scrollDragStartScrollY + dy * maxScrollY / trackH, 0, maxScrollY)
+            end
+        elseif contentDragActive then
+            local dy = my - contentDragStartY
+            scrollY = clamp(contentDragStartScrollY - dy, 0, maxScrollY)
+        end
+    else
+        scrollDragActive  = false
+        contentDragActive = false
+    end
+end
+
+-- Click on release (not while dragging). wasDragging is captured BEFORE
+-- the block above resets scrollDragActive/contentDragActive to false on
+-- this same release frame - checking the (already-reset) live flags here
+-- meant a scrollbar-thumb drag always fell through to a click on release,
+-- hitting whatever list row happened to be under the cursor.
+if release and not wasDragging then
+    handleClick()
+end
+
+-- Draw active view
+if     view=="home"       then drawHome()
+elseif view=="list"       then drawList()
+elseif view=="detail"     then drawDetail()
+elseif view=="clone"      then drawClone()
+elseif view=="cloneItems" then drawCloneItems()
+end
+
+if view=="keyboard" then
+    if kbTarget=="search" then drawHome() else drawDetail() end
+    drawKeyboard()
+end
+
+-- ── Debug overlay (bottom-right, toggle with DBG in home view) ─
+frameCount = frameCount + 1
+if debugEnabled then do
+    local iconStatus = dbIconHard and "handle-ok" or "nil"
+
+    local lines = {
+        "DBG v2.3  f:"..frameCount,
+        "view="..view.."  dbs="..dbCount,
+        "recv S"..recvSession.." "..recvGotCount.."/"..recvExpected,
+        "scroll="..math.floor(scrollY).."/"..math.floor(maxScrollY),
+        "icon="..iconStatus,
+        "wheel="..tostring(lastWheelDbg),
+        "cmd="..lastCmd,
+    }
+    local lh = 13
+    local bw = 215
+    local bh = #lines*lh+6
+    local bx = rx-bw-2
+    local by = ry-bh-2
+    setNextFillColor(uiLayer,0,0,0,0.60)
+    addBox(uiLayer,bx,by,bw,bh)
+    for i,line in ipairs(lines) do
+        setNextFillColor(uiLayer,0.35,0.95,0.45,0.95)
+        setNextTextAlign(uiLayer,AlignH_Left,AlignV_Top)
+        addText(uiLayer,smallfont,line,bx+3,by+3+(i-1)*lh)
+    end
+end end  -- close do + if debugEnabled
+
+setBackgroundColor(0,0,0)
+
+
