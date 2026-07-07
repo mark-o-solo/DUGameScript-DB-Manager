@@ -124,7 +124,15 @@ function searchDBs(query)
                 end
             end
         end
-        if #matches > 0 then searchResults[i] = matches end
+        -- Assign for EVERY db (empty table when no matches), never conditionally.
+        -- A sparse searchResults (hole at any index where a db had zero matches)
+        -- gets JSON-encoded by dkjson as an array containing `null` (e.g. a hole
+        -- at index 1 -> "[null,[...]]"). The screen's decoder appends array items
+        -- with arr[#arr+1]=parse(), and a null decodes to nil, which doesn't grow
+        -- the array - so every match list past the hole silently shifts down one
+        -- index (13 ArchHUD matches showing up as a badge on the empty DB #1).
+        -- Keeping it dense means clean, hole-free indices on the wire.
+        searchResults[i] = matches
     end
 end
 

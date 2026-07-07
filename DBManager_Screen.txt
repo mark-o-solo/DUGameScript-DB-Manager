@@ -157,6 +157,8 @@ if not init then
     selectedKey             = ""
     scrollY                 = 0
     maxScrollY              = 0
+    valueScrollY            = 0
+    maxValueScrollY         = 0
     lastListY               = 0
     mx, my                  = 0, 0
     down                    = false
@@ -210,6 +212,35 @@ function truncStr(s, maxW)
     if not s then return "" end
     if #s <= maxW then return s end
     return s:sub(1, maxW-2)..".."
+end
+-- Word-wrap into lines of at most maxChars, respecting explicit "\n"
+-- already present in the stored value; overlong single words are hard-
+-- broken so they can't force a line past maxChars.
+function wrapTextLines(str, maxChars)
+    local lines = {}
+    for rawLine in (str.."\n"):gmatch("(.-)\n") do
+        if rawLine == "" then
+            lines[#lines+1] = ""
+        else
+            local cur = ""
+            for word in rawLine:gmatch("%S+") do
+                if cur == "" then
+                    cur = word
+                elseif #cur + 1 + #word <= maxChars then
+                    cur = cur.." "..word
+                else
+                    lines[#lines+1] = cur
+                    cur = word
+                end
+                while #cur > maxChars do
+                    lines[#lines+1] = cur:sub(1,maxChars)
+                    cur = cur:sub(maxChars+1)
+                end
+            end
+            lines[#lines+1] = cur
+        end
+    end
+    return lines
 end
 function hitTest(bx,by,bw,bh)
     return mx>=bx and mx<=bx+bw and my>=by and my<=by+bh
@@ -504,6 +535,22 @@ function drawHome()
     maxScrollY = math.max(0, math.ceil(dbCount/2)*(cardH+PAD)-(ry-cardStartY))
 end
 
+-- Entries in display order: when a search is active, the matching entries for the
+-- currently-open DB are floated to the top (in their original relative order), followed
+-- by the rest. Both drawList and clickList use this so row index -> entry stays aligned.
+function orderedEntries(db)
+    local sr = (searchQuery ~= "") and searchResults[selectedDB] or nil
+    if not sr or #sr == 0 then return db.entries end
+    local matchSet = {}
+    for _, k in ipairs(sr) do matchSet[k] = true end
+    local ordered, rest = {}, {}
+    for _, e in ipairs(db.entries) do
+        if matchSet[e.key] then ordered[#ordered+1] = e else rest[#rest+1] = e end
+    end
+    for _, e in ipairs(rest) do ordered[#ordered+1] = e end
+    return ordered
+end
+
 -- ── VIEW: LIST ───────────────────────────────────────────────
 function drawList()
     local db = dbData[selectedDB]
@@ -534,16 +581,31 @@ function drawList()
     setNextStrokeWidth(uiLayer,1)
     addLine(uiLayer,PAD,listY-2,PAD+rowW,listY-2)
 
-    for i, entry in ipairs(db.entries) do
+    local entries = orderedEntries(db)
+    for i, entry in ipairs(entries) do
         local ey = listY+(i-1)*ROW_H-scrollY
         if ey+ROW_H > listY and ey < ry then
             local hover = hitTest(PAD,ey,rowW,ROW_H)
 
-            setNextFillColor(listLayer,
-                hover and 0.18 or 0.1,
-                hover and 0.22 or 0.13,
-                hover and 0.28 or 0.16,
-                (i%2==0) and (hover and 1 or 0.7) or (hover and 1 or 0.45))
+            local isSearchMatch = false
+            if searchQuery~="" and searchResults[selectedDB] then
+                for _, mk in ipairs(searchResults[selectedDB]) do
+                    if mk == entry.key then isSearchMatch=true; break end
+                end
+            end
+
+            -- Search matches are floated to the top (orderedEntries) and drawn with a
+            -- gold-tinted row so they read as a highlighted block above the rest.
+            if isSearchMatch then
+                setNextFillColor(listLayer,
+                    hover and 0.32 or 0.24, hover and 0.24 or 0.17, hover and 0.06 or 0.03, hover and 1 or 0.9)
+            else
+                setNextFillColor(listLayer,
+                    hover and 0.18 or 0.1,
+                    hover and 0.22 or 0.13,
+                    hover and 0.28 or 0.16,
+                    (i%2==0) and (hover and 1 or 0.7) or (hover and 1 or 0.45))
+            end
             addBox(listLayer,PAD,ey,rowW,ROW_H)
 
             local keyTrunc = truncStr(entry.key, math.floor(keyColW/8))
@@ -568,16 +630,10 @@ function drawList()
                 addText(listLayer,smallfont,">",PAD+rowW-4,ey+ROW_H*0.5)
             end
 
-            local isSearchMatch = false
-            if searchResults[selectedDB] then
-                for _, mk in ipairs(searchResults[selectedDB]) do
-                    if mk == entry.key then isSearchMatch=true; break end
-                end
-            end
             if isSearchMatch then
                 setNextFillColor(listLayer,0,0,0,0)
-                setNextStrokeColor(listLayer,GOLD[1],GOLD[2],GOLD[3],0.6)
-                setNextStrokeWidth(listLayer,1)
+                setNextStrokeColor(listLayer,GOLD[1],GOLD[2],GOLD[3],1)
+                setNextStrokeWidth(listLayer,2)
                 addBox(listLayer,PAD,ey,rowW,ROW_H)
             end
         end
@@ -627,11 +683,20 @@ function drawDetail()
     setNextStrokeColor(uiLayer,valEditing and GOLD[1] or CYAN[1]*0.6, valEditing and GOLD[2] or CYAN[2]*0.6, valEditing and GOLD[3] or CYAN[3]*0.6,1)
     setNextStrokeWidth(uiLayer,valEditing and 2 or 1)
     addBox(uiLayer,fieldX,y,fieldW-70,valBoxH)
-    setNextFillColor(uiLayer,0.9,0.9,0.9,1)
-    setNextTextAlign(uiLayer,AlignH_Left,AlignV_Top)
-    local valDisplay = editValue
-    if #valDisplay > 300 then valDisplay = valDisplay:sub(1,300)..".." end
-    addText(uiLayer,smallfont,valDisplay,fieldX+8,y+8)
+    local valInnerW  = fieldW-70-16
+    local valMaxChars = math.max(4, math.floor(valInnerW/7))
+    local valLines   = wrapTextLines(editValue, valMaxChars)
+    local valLineH   = math.max(14, math.floor(18*_scale))
+    maxValueScrollY  = math.max(0, #valLines*valLineH - (valBoxH-16))
+    valueScrollY     = clamp(valueScrollY, 0, maxValueScrollY)
+    for li, ln in ipairs(valLines) do
+        local ly = y+8+(li-1)*valLineH-valueScrollY
+        if ly+valLineH > y and ly < y+valBoxH then
+            setNextFillColor(uiLayer,0.9,0.9,0.9,1)
+            setNextTextAlign(uiLayer,AlignH_Left,AlignV_Top)
+            addText(uiLayer,smallfont,ln,fieldX+8,ly)
+        end
+    end
     drawButton(fieldX+fieldW-62,y+4,58,ROW_H-4,"Edit",CYAN,smallfont)
 
     y = y+valBoxH+PAD*2
@@ -1139,7 +1204,7 @@ function clickList()
 
     -- Add button
     if hitTest(rx-PAD-100-SB_W,hdrH+PAD,95,ROW_H) then
-        editKey=""; editValue=""; selectedKey=""; isNewEntry=true; view="detail"; return
+        editKey=""; editValue=""; selectedKey=""; isNewEntry=true; valueScrollY=0; view="detail"; return
     end
 
     -- Scrollbar interactions
@@ -1163,12 +1228,12 @@ function clickList()
     -- Entry rows
     local db = dbData[selectedDB]
     if not db then return end
-    for i,entry in ipairs(db.entries) do
+    for i,entry in ipairs(orderedEntries(db)) do
         local ey = listY+(i-1)*ROW_H-scrollY
         if ey+ROW_H>listY and ey<ry then
             if hitTest(PAD,ey,rowW,ROW_H) then
                 editKey=entry.key; editValue=entry.value; selectedKey=entry.key
-                isNewEntry=false; view="detail"; return
+                isNewEntry=false; valueScrollY=0; view="detail"; return
             end
         end
     end
@@ -1349,7 +1414,7 @@ function clickKeyboard()
         elseif kbTarget=="editKey" then
             editKey=kbText
         elseif kbTarget=="editValue" then
-            editValue=kbText
+            editValue=kbText; valueScrollY=0
         end
         kbShift=false; kbSpecial=false
         view=(kbTarget=="search") and "home" or "detail"; return
@@ -1378,6 +1443,8 @@ if rawInput and rawInput~="" and rawInput~=lastInput then
             lastWheelDbg = wh
             if view=="list" or view=="home" or view=="cloneItems" then
                 scrollY = clamp(scrollY - wh * ROW_H * 2, 0, maxScrollY)
+            elseif view=="detail" then
+                valueScrollY = clamp(valueScrollY - wh * ROW_H, 0, maxValueScrollY)
             end
         end
         if msg.t=="boot" then
